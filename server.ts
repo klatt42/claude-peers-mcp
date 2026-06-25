@@ -71,7 +71,10 @@ async function ensureBroker(): Promise<void> {
   }
 
   log("Starting broker daemon...");
-  const proc = Bun.spawn(["bun", BROKER_SCRIPT], {
+  // Use this process's own bun binary (process.execPath), not a bare "bun" —
+  // sessions launched via `wsl.exe -e bash -ic` may not have bun on PATH,
+  // which caused ENOENT when spawning the broker (and the server itself).
+  const proc = Bun.spawn([process.execPath, BROKER_SCRIPT], {
     stdio: ["ignore", "ignore", "inherit"],
     // Detach so the broker survives if this MCP server exits
     // On macOS/Linux, the broker will keep running
@@ -401,8 +404,25 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
 // --- Polling loop for inbound messages ---
 
+// True only if this CC session negotiated the channel (i.e. was launched with
+// --dangerously-load-development-channels server:claude-peers). Pushed channel
+// notifications are only surfaced to the model when this is true.
+function channelActive(): boolean {
+  const caps = mcp.getClientCapabilities() as
+    | { experimental?: Record<string, unknown> }
+    | undefined;
+  return !!(caps && caps.experimental && caps.experimental["claude/channel"]);
+}
+
 async function pollAndPushMessages() {
   if (!myId) return;
+
+  // CRITICAL: only the background loop CONSUMES messages (/poll-messages marks
+  // them delivered). Do that ONLY when the channel is active — otherwise the
+  // push below is silently dropped by CC and the message is destroyed before
+  // the user can retrieve it. Without a channel, leave messages queued and let
+  // the check_messages tool pull them on demand (pull-based receiving).
+  if (!channelActive()) return;
 
   try {
     const result = await brokerFetch<PollMessagesResponse>("/poll-messages", { id: myId });
@@ -487,16 +507,36 @@ async function main() {
   // Wait briefly for summary, but don't block startup
   await Promise.race([summaryPromise, new Promise((r) => setTimeout(r, 3000))]);
 
-  // 4. Register with broker
-  const reg = await brokerFetch<RegisterResponse>("/register", {
-    pid: process.pid,
-    cwd: myCwd,
-    git_root: myGitRoot,
-    tty,
-    summary: initialSummary,
-  });
-  myId = reg.id;
-  log(`Registered as peer ${myId}`);
+  // 4. Register with broker — retry with backoff. A burst launch (e.g. several
+  //    tabs opened at once) can race the broker cold-start; a one-shot register
+  //    that throws would kill this server and leave the session invisible for
+  //    its whole life. Never let a transient miss be fatal.
+  const doRegister = async (): Promise<boolean> => {
+    try {
+      await ensureBroker();
+      const reg = await brokerFetch<RegisterResponse>("/register", {
+        pid: process.pid,
+        cwd: myCwd,
+        git_root: myGitRoot,
+        tty,
+        summary: initialSummary,
+      });
+      myId = reg.id;
+      log(`Registered as peer ${myId}`);
+      return true;
+    } catch (e) {
+      log(`Register failed: ${e instanceof Error ? e.message : String(e)}`);
+      return false;
+    }
+  };
+
+  for (let attempt = 1; attempt <= 10 && !myId; attempt++) {
+    if (await doRegister()) break;
+    await new Promise((r) => setTimeout(r, Math.min(3000, 300 * attempt)));
+  }
+  if (!myId) {
+    log("Not registered after initial retries; heartbeat will keep trying");
+  }
 
   // If summary generation is still running, update it when done
   if (!initialSummary) {
@@ -519,13 +559,44 @@ async function main() {
   // 6. Start polling for inbound messages
   const pollTimer = setInterval(pollAndPushMessages, POLL_INTERVAL_MS);
 
-  // 7. Start heartbeat
+  // 7. Start heartbeat + self-heal. If we never registered (broker was down at
+  //    launch) or the broker was restarted and forgot us, rejoin automatically.
+  //    Register is idempotent by PID on the broker side, so re-registering is
+  //    safe. This is what makes peer discovery survive a broker bounce.
+  let hbFails = 0;
+  // Lightweight re-register used by self-heal. Deliberately does NOT call
+  // ensureBroker — spawning a broker on every heartbeat-miss caused stray
+  // broker churn under load. The broker is a managed daemon (restart-rok.sh);
+  // if it's briefly unreachable we just retry registering next tick.
+  const reregister = async () => {
+    try {
+      const reg = await brokerFetch<RegisterResponse>("/register", {
+        pid: process.pid,
+        cwd: myCwd,
+        git_root: myGitRoot,
+        tty,
+        summary: initialSummary,
+      });
+      myId = reg.id;
+      log(`Re-registered as peer ${myId}`);
+    } catch {
+      // still unreachable; try again next tick
+    }
+  };
   const heartbeatTimer = setInterval(async () => {
-    if (myId) {
-      try {
-        await brokerFetch("/heartbeat", { id: myId });
-      } catch {
-        // Non-critical
+    try {
+      if (!myId) {
+        await reregister();
+        return;
+      }
+      await brokerFetch("/heartbeat", { id: myId });
+      hbFails = 0;
+    } catch {
+      // Broker briefly unreachable; only give up our id after several misses
+      // (avoids id-churn from a single load-induced timeout).
+      if (++hbFails >= 3) {
+        myId = null;
+        hbFails = 0;
       }
     }
   }, HEARTBEAT_INTERVAL_MS);
