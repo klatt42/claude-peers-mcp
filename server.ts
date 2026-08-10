@@ -299,6 +299,21 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
     case "send_message": {
       const { to_id, message } = args as { to_id: string; message: string };
+      // Callers drift to the built-in SendMessage tool's `to` param; without this
+      // check the undefined key is dropped by JSON.stringify and the broker reports
+      // "Peer undefined not found", which misdirects diagnosis at the registry.
+      if (typeof to_id !== "string" || to_id.length === 0 || typeof message !== "string") {
+        const got = Object.keys((args as object) ?? {}).join(", ") || "none";
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Invalid arguments: send_message requires string params to_id and message (got keys: ${got}). Note: the param is to_id, not "to".`,
+            },
+          ],
+          isError: true,
+        };
+      }
       if (!myId) {
         return {
           content: [{ type: "text" as const, text: "Not registered with broker yet" }],
