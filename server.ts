@@ -26,11 +26,6 @@ import type {
   PollMessagesResponse,
   Message,
 } from "./shared/types.ts";
-import {
-  generateSummary,
-  getGitBranch,
-  getRecentFiles,
-} from "./shared/summarize.ts";
 
 // --- Configuration ---
 
@@ -498,29 +493,16 @@ async function main() {
   log(`Git root: ${myGitRoot ?? "(none)"}`);
   log(`TTY: ${tty ?? "(unknown)"}`);
 
-  // 3. Generate initial summary via gpt-5.4-nano (non-blocking, best-effort)
-  let initialSummary = "";
-  const summaryPromise = (async () => {
-    try {
-      const branch = await getGitBranch(myCwd);
-      const recentFiles = await getRecentFiles(myCwd);
-      const summary = await generateSummary({
-        cwd: myCwd,
-        git_root: myGitRoot,
-        git_branch: branch,
-        recent_files: recentFiles,
-      });
-      if (summary) {
-        initialSummary = summary;
-        log(`Auto-summary: ${summary}`);
-      }
-    } catch (e) {
-      log(`Auto-summary failed (non-critical): ${e instanceof Error ? e.message : String(e)}`);
-    }
-  })();
-
-  // Wait briefly for summary, but don't block startup
-  await Promise.race([summaryPromise, new Promise((r) => setTimeout(r, 3000))]);
+  // 3. Initial summary: NONE. Seats set their own via set_summary (every ROK loader does).
+  //    REMOVED 2026-08-26 (operator ruling): this used to POST cwd + git root + branch + up to
+  //    10 recent FILE NAMES to api.openai.com (gpt-5.4-nano) whenever OPENAI_API_KEY happened to
+  //    be exported — an outbound call nobody saw, armed by an env var set for unrelated tools,
+  //    with no ZDR and no log. Measured over ~4 months: it never fired here, and the only peers
+  //    with blank summaries were ones that never called set_summary. The fallback bought nothing
+  //    and carried a silent egress path, so it is gone rather than gated.
+  //    Cost of the removal, stated: a session that never calls set_summary shows an empty summary
+  //    in list_peers. Say what you are doing; do not have a third party guess it.
+  const initialSummary = "";
 
   // 4. Register with broker — retry with backoff. A burst launch (e.g. several
   //    tabs opened at once) can race the broker cold-start; a one-shot register
@@ -551,20 +533,6 @@ async function main() {
   }
   if (!myId) {
     log("Not registered after initial retries; heartbeat will keep trying");
-  }
-
-  // If summary generation is still running, update it when done
-  if (!initialSummary) {
-    summaryPromise.then(async () => {
-      if (initialSummary && myId) {
-        try {
-          await brokerFetch("/set-summary", { id: myId, summary: initialSummary });
-          log(`Late auto-summary applied: ${initialSummary}`);
-        } catch {
-          // Non-critical
-        }
-      }
-    });
   }
 
   // 5. Connect MCP over stdio

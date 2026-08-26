@@ -13,7 +13,7 @@ Peer discovery and messaging MCP channel for Claude Code instances.
 - `broker.ts` — Singleton HTTP daemon on localhost:7899 + SQLite. Auto-launched by the MCP server.
 - `server.ts` — MCP stdio server, one per Claude Code instance. Connects to broker, exposes tools, pushes channel notifications.
 - `shared/types.ts` — Shared TypeScript types for broker API.
-- `shared/summarize.ts` — Auto-summary generation via gpt-5.4-nano.
+- (removed 2026-08-26) `shared/summarize.ts` held an OpenAI auto-summary that POSTed cwd/branch/recent filenames to api.openai.com whenever `OPENAI_API_KEY` was exported. Operator ruling: removed, not gated — silent egress, never used here. Peers set their own summary with `set_summary`; the file's git helpers went with it (no other caller).
 - `cli.ts` — CLI utility for inspecting broker state.
 
 ## Running
